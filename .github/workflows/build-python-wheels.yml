@@ -1,0 +1,231 @@
+name: Build Python Wheels
+
+on:
+  push:
+    branches: [master]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build-wheels:
+    name: Build wheels on ${{ matrix.os }} - ${{ matrix.arch }} - Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-13, macos-14]
+        python-version: ['3.7', '3.8', '3.9', '3.10', '3.11', '3.12']
+        arch: [x86_64, arm64]
+        exclude:
+          # macOS 13 doesn't support arm64 builds natively
+          - os: macos-13
+            arch: arm64
+          # macOS 14 (M1) doesn't support x86_64 builds natively
+          - os: macos-14
+            arch: x86_64
+          # Python 3.7 is not available on macos-14 (M1)
+          - os: macos-14
+            python-version: '3.7'
+          # Ubuntu builds arm64 using cross-compilation
+          - os: ubuntu-latest
+            arch: arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+
+      - name: Build static library
+        run: |
+          cd ${{ github.workspace }}
+          make static -B
+
+      - name: Build wheel
+        run: |
+          cd python
+          uv venv .venv -p ${{ matrix.python-version }}
+          source .venv/bin/activate
+          if [ "${{ matrix.python-version }}" = "3.7" ]; then
+            uv pip install -r requirements-py37.txt
+          else
+            uv pip install -r requirements.txt
+          fi
+          uv pip install 'cffi>=1.0.0' setuptools wheel
+          python build_enry.py
+          python setup.py bdist_wheel
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.arch }}-py${{ matrix.python-version }}
+          path: python/dist/*.whl
+          retention-days: 7
+
+  build-wheels-linux-arm64:
+    name: Build wheels on Linux arm64 - Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.7', '3.8', '3.9', '3.10', '3.11', '3.12']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build wheel in Docker (arm64)
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            --entrypoint /bin/bash \
+            python:${{ matrix.python-version }}-slim \
+            -c "
+              apt-get update && apt-get install -y wget gcc make git && \
+              wget -q https://go.dev/dl/go1.21.0.linux-arm64.tar.gz && \
+              tar -C /usr/local -xzf go1.21.0.linux-arm64.tar.gz && \
+              export PATH=\$PATH:/usr/local/go/bin && \
+              cd /workspace && \
+              make static -B && \
+              cd python && \
+              pip install --upgrade pip && \
+              if [ '${{ matrix.python-version }}' = '3.7' ]; then \
+                pip install -r requirements-py37.txt; \
+              else \
+                pip install -r requirements.txt; \
+              fi && \
+              pip install 'cffi>=1.0.0' setuptools wheel && \
+              python build_enry.py && \
+              python setup.py bdist_wheel
+            "
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-arm64-py${{ matrix.python-version }}
+          path: python/dist/*.whl
+          retention-days: 7
+
+  build-wheels-linux-x86_64:
+    name: Build wheels on Linux x86_64 - Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.7', '3.8', '3.9', '3.10', '3.11', '3.12']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build wheel with Docker (Python 3.7)
+        if: matrix.python-version == '3.7'
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            --entrypoint /bin/bash \
+            python:${{ matrix.python-version }}-slim \
+            -c "
+              apt-get update && apt-get install -y wget gcc make git && \
+              wget -q https://go.dev/dl/go1.21.0.linux-amd64.tar.gz && \
+              tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz && \
+              export PATH=\$PATH:/usr/local/go/bin && \
+              cd /workspace && \
+              make static -B && \
+              cd python && \
+              pip install --upgrade pip && \
+              pip install -r requirements-py37.txt && \
+              pip install 'cffi>=1.0.0,<1.16.0' setuptools wheel && \
+              python build_enry.py && \
+              python setup.py bdist_wheel
+            "
+
+      - name: Set up Python ${{ matrix.python-version }}
+        if: matrix.python-version != '3.7'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Go
+        if: matrix.python-version != '3.7'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Install uv
+        if: matrix.python-version != '3.7'
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+
+      - name: Build static library
+        if: matrix.python-version != '3.7'
+        run: |
+          cd ${{ github.workspace }}
+          make static -B
+
+      - name: Build wheel (Python 3.8+)
+        if: matrix.python-version != '3.7'
+        run: |
+          cd python
+          uv venv .venv -p ${{ matrix.python-version }}
+          source .venv/bin/activate
+          uv pip install -r requirements.txt
+          uv pip install 'cffi>=1.0.0' setuptools wheel
+          python build_enry.py
+          python setup.py bdist_wheel
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-x86_64-py${{ matrix.python-version }}
+          path: python/dist/*.whl
+          retention-days: 7
+
+  collect-wheels:
+    name: Collect all wheels
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [build-wheels, build-wheels-linux-arm64, build-wheels-linux-x86_64]
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: all-wheels
+          pattern: wheel-*
+          merge-multiple: true
+
+      - name: List all wheels
+        run: |
+          echo "Built wheels:"
+          ls -lh all-wheels/
+
+      - name: Upload combined wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheels-all
+          path: all-wheels/*.whl
+          retention-days: 30
